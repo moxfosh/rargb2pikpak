@@ -1,0 +1,2 @@
+# rargb2pikpak
+RARGB根据关键字搜索批量云下载至PikPak
