@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RARGB 批量云下载到 PikPak
 // @namespace    rargb-pikpak
-// @version      3.0.0
+// @version      3.1.0
 // @description  将 RARGB 当前列表逐页转存到 PikPak，也可搜索并选择单独条目。
 // @match        https://rargb.to/*
 // @match        https://www.rargb.to/*
@@ -21,10 +21,9 @@
 
   const current = new URL(location.href);
   const drive = 'https://mypikpak.com/drive/all';
-  const transferParam = 'rargb_transfer';
-  const transferStorage = 'rargb-pikpak-transfer';
   const queueParam = 'rargb_queue';
   const batchSize = 10;
+  const reviewTimeout = 15 * 60 * 1000;
   const siteSearch = /^\/(?:search(?:\/|$)|torrents\.php$)/i;
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -40,6 +39,40 @@
   }
 
   const queueKeys = id => [`rargb-pikpak-queue-${id}`, `rargb-pikpak-receipt-${id}`];
+
+  async function withQueue(signal, enqueue) {
+    const id = crypto.randomUUID();
+    const [jobKey, receiptKey] = queueKeys(id);
+    const target = new URL(drive);
+    target.searchParams.set(queueParam, id);
+    let sequence = 0;
+    const expires = () => Date.now() + reviewTimeout + 90000;
+    GM_setValue(jobKey, { sequence, expires: expires() });
+    try {
+      const tab = GM_openInTab(target.href, { active: true });
+      const getReceipt = () => {
+        if (tab?.closed) throw new Error('PikPak 标签页已关闭。');
+        return GM_getValue(receiptKey);
+      };
+      if (!await waitFor(getReceipt, 55000, signal)) {
+        throw new Error('PikPak 未就绪。请确认已登录，且 Tampermonkey 能在 mypikpak.com 运行脚本。');
+      }
+      await enqueue(async (batch, review = null) => {
+        signal.throwIfAborted();
+        sequence++;
+        GM_setValue(jobKey, { sequence, links: batch.join('\n'), review, expires: expires() });
+        const receipt = await waitFor(() => {
+          const value = getReceipt();
+          return value?.sequence === sequence ? value : null;
+        }, review ? reviewTimeout + 65000 : 65000, signal);
+        if (!receipt) throw new Error('未收到 PikPak 批次回执，请先检查云下载任务。');
+        if (receipt.error) throw new Error(receipt.error);
+      });
+    } finally {
+      GM_deleteValue(jobKey);
+      GM_deleteValue(receiptKey);
+    }
+  }
 
   if (current.origin === new URL(drive).origin) {
     const findLinkInput = () => [...document.querySelectorAll('textarea[placeholder]')]
@@ -77,18 +110,48 @@
           const input = await waitFor(findLinkInput, 12000);
           if (!input || input.value.trim()) throw new Error('PikPak 的云下载输入框不可用。');
           if (!GM_getValue(jobKey)) return;
-          fillLinks(input, job.links);
           const dialog = input.closest('[role="dialog"], dialog') || document;
-          const submit = await waitFor(() => [...dialog.querySelectorAll('button')].find(control =>
-            control.getClientRects().length && !control.disabled && control.getAttribute('aria-disabled') !== 'true'
-            && /^(?:立即创建|立即建立|create now)$/i.test(control.textContent.trim())), 10000);
-          if (!submit) throw new Error('PikPak 未启用「立即创建」，请查看当前批次。');
-          if (!GM_getValue(jobKey)) return;
+          const isSubmit = control => control?.getClientRects().length && !control.disabled
+            && control.getAttribute('aria-disabled') !== 'true'
+            && /^(?:立即创建|立即建立|create now)$/i.test(control.textContent.trim());
           const alerts = () => [...document.querySelectorAll('[role="alert"], [data-sonner-toast], .el-message')]
             .filter(element => element.getClientRects().length)
             .map(element => element.textContent.trim());
           const earlierAlerts = new Set(alerts());
-          submit.click();
+          fillLinks(input, job.links);
+          await sleep(0);
+          if (input.value.length !== job.links.length) throw new Error('PikPak 输入框未完整接收本批链接。');
+          if (job.review) {
+            GM_setClipboard(job.links, 'text');
+            const feedback = document.createElement('p');
+            feedback.setAttribute('role', 'status');
+            feedback.textContent = `RARGB 第 ${received} / ${job.review.total} 批。核对保存位置后点击「立即创建」。`;
+            input.before(feedback);
+            let decision;
+            const onClick = event => {
+              const control = event.target.closest?.('button');
+              if (!control || !dialog.contains(control)) return;
+              if (isSubmit(control)) decision = 'submit';
+              else if (/^(?:取消|关闭此对话框|cancel|close this dialog)$/i.test(control.getAttribute('aria-label') || control.textContent.trim())) {
+                decision = 'cancel';
+              }
+            };
+            dialog.addEventListener('click', onClick, true);
+            try {
+              const action = await waitFor(() => decision || (!GM_getValue(jobKey) && 'stop')
+                || (!input.isConnected && 'cancel'), reviewTimeout);
+              if (action === 'stop') return;
+              if (action !== 'submit') throw new Error(action === 'cancel' ? 'PikPak 批次已取消。' : '等待确认本批次超时。');
+            } finally {
+              dialog.removeEventListener('click', onClick, true);
+              feedback.remove();
+            }
+          } else {
+            const submit = await waitFor(() => [...dialog.querySelectorAll('button')].find(isSubmit), 10000);
+            if (!submit) throw new Error('PikPak 未启用「立即创建」，请查看当前批次。');
+            if (!GM_getValue(jobKey)) return;
+            submit.click();
+          }
           const settled = await waitFor(() => {
             const failure = alerts().find(message => !earlierAlerts.has(message)
               && /失败|额度|超出|上限|無效|無法建立|failed|limit exceeded|quota/i.test(message));
@@ -106,27 +169,6 @@
       }
     }
 
-    const id = current.searchParams.get(transferParam);
-    const draft = id && GM_getValue(transferStorage);
-    if (draft?.id !== id || !draft?.links || draft.expires < Date.now()) return;
-
-    let triggered = false;
-    const deadline = Date.now() + 15000;
-    while (Date.now() < deadline) {
-      const input = findLinkInput();
-      if (input) {
-        if (input.value.trim() && input.value !== draft.links) return;
-        fillLinks(input, draft.links);
-        GM_deleteValue(transferStorage);
-        return;
-      }
-      const button = !triggered && openDialog();
-      if (button) {
-        triggered = true;
-        button.click();
-      }
-      await sleep(250);
-    }
     return;
   }
 
@@ -341,68 +383,48 @@
   };
 
   get('all').onclick = () => run(async signal => {
-    const id = crypto.randomUUID();
-    const [jobKey, receiptKey] = queueKeys(id);
-    const target = new URL(drive);
-    target.searchParams.set(queueParam, id);
-    const expires = () => Date.now() + 15 * 60 * 1000;
-    let sequence = 0;
     let pages = 0;
     let submitted = 0;
     let skipped = 0;
-    GM_setValue(jobKey, { sequence, expires: expires() });
     try {
       report('正在连接 PikPak。请保持两个标签页打开。');
-      GM_openInTab(target.href, { active: true });
-      if (!await waitFor(() => GM_getValue(receiptKey), 55000, signal)) {
-        throw new Error('PikPak 未就绪。请确认已登录，且 Tampermonkey 能在 mypikpak.com 运行脚本。');
-      }
-      const seen = new Set();
-      const visited = new Set();
-      let url = current;
-      let page = document;
-      while (url && !visited.has(url.href)) {
-        signal.throwIfAborted();
-        visited.add(url.href);
-        pages++;
-        const rows = readResults(page, url);
-        if (!rows.length) throw new Error(`第 ${pages} 个扫描页面没有可读取的列表。`);
-        const links = [];
-        for (const item of rows) {
-          if (seen.has(item.id)) continue;
-          seen.add(item.id);
-          report(`正在读取第 ${pages} 个页面，已提交 ${submitted} 条。`);
-          try {
-            links.push(await magnetFor(item, signal));
-          } catch (error) {
-            if (signal.aborted || error.stopBatch) throw error;
-            skipped++;
-          }
-        }
-        for (let offset = 0; offset < links.length; offset += batchSize) {
+      await withQueue(signal, async submit => {
+        const seen = new Set();
+        const visited = new Set();
+        let url = current;
+        let page = document;
+        while (url && !visited.has(url.href)) {
           signal.throwIfAborted();
-          const batch = links.slice(offset, offset + batchSize);
-          sequence++;
-          report(`正在提交第 ${pages} 个页面的磁力链接，已提交 ${submitted} 条。`);
-          GM_setValue(jobKey, { sequence, links: batch.join('\n'), expires: expires() });
-          const receipt = await waitFor(() => {
-            const value = GM_getValue(receiptKey);
-            return value?.sequence === sequence ? value : null;
-          }, 65000, signal);
-          if (!receipt) throw new Error('未收到 PikPak 批次回执，请先检查云下载任务。');
-          if (receipt.error) throw new Error(receipt.error);
-          submitted += batch.length;
+          visited.add(url.href);
+          pages++;
+          const rows = readResults(page, url);
+          if (!rows.length) throw new Error(`第 ${pages} 个扫描页面没有可读取的列表。`);
+          const links = [];
+          for (const item of rows) {
+            if (seen.has(item.id)) continue;
+            seen.add(item.id);
+            report(`正在读取第 ${pages} 个页面，已提交 ${submitted} 条。`);
+            try {
+              links.push(await magnetFor(item, signal));
+            } catch (error) {
+              if (signal.aborted || error.stopBatch) throw error;
+              skipped++;
+            }
+          }
+          for (let offset = 0; offset < links.length; offset += batchSize) {
+            const batch = links.slice(offset, offset + batchSize);
+            report(`正在提交第 ${pages} 个页面的磁力链接，已提交 ${submitted} 条。`);
+            await submit(batch);
+            submitted += batch.length;
+          }
+          url = nextPage(page, url);
+          if (url && !visited.has(url.href)) page = await readPage(url, signal);
         }
-        url = nextPage(page, url);
-        if (url && !visited.has(url.href)) page = await readPage(url, signal);
-      }
+      });
       report(`已处理到最后一页。扫描 ${pages} 页，提交 ${submitted} 条，${skipped} 条未取得磁力链接。`);
     } catch (error) {
       const progress = `已扫描 ${pages} 页，已确认提交 ${submitted} 条，${skipped} 条未取得磁力链接。`;
       report(signal.aborted ? `操作已停止。${progress}` : `${error.message} ${progress}`);
-    } finally {
-      GM_deleteValue(jobKey);
-      GM_deleteValue(receiptKey);
     }
   });
 
@@ -420,13 +442,23 @@
       }
     }
     if (!links.length) throw new Error('所选结果中未取得磁力链接。');
-    const text = links.join('\n');
-    const id = crypto.randomUUID();
-    GM_setValue(transferStorage, { id, links: text, expires: Date.now() + 10 * 60 * 1000 });
-    GM_setClipboard(text, 'text');
-    const target = new URL(drive);
-    target.searchParams.set(transferParam, id);
-    GM_openInTab(target.href, { active: true });
-    report(`已准备 ${links.length} 条磁力链接，${selected.length - links.length} 条未取得。若 PikPak 未自动填入，可以直接粘贴。`);
+    const total = Math.ceil(links.length / batchSize);
+    const skipped = selected.length - links.length;
+    let submitted = 0;
+    try {
+      report('正在连接 PikPak。请保持两个标签页打开。');
+      await withQueue(signal, async submit => {
+        for (let offset = 0; offset < links.length; offset += batchSize) {
+          const batch = links.slice(offset, offset + batchSize);
+          report(`请在 PikPak 确认第 ${1 + offset / batchSize} / ${total} 批，已提交 ${submitted} 条。`);
+          await submit(batch, { total });
+          submitted += batch.length;
+        }
+      });
+      report(`已提交 ${submitted} 条，共 ${total} 批。${skipped} 条未取得磁力链接。`);
+    } catch (error) {
+      const progress = `已确认提交 ${submitted} 条，${skipped} 条未取得磁力链接。`;
+      report(signal.aborted ? `操作已停止。${progress}` : `${error.message} ${progress}`);
+    }
   });
 })();
