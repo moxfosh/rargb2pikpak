@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RARGB 批量云下载到 PikPak
 // @namespace    rargb-pikpak
-// @version      3.1.0
+// @version      3.2.0
 // @description  将 RARGB 当前列表逐页转存到 PikPak，也可搜索并选择单独条目。
 // @match        https://rargb.to/*
 // @match        https://www.rargb.to/*
@@ -22,6 +22,7 @@
   const current = new URL(location.href);
   const drive = 'https://mypikpak.com/drive/all';
   const queueParam = 'rargb_queue';
+  const historyKey = 'rargb-pikpak-submission-history';
   const batchSize = 10;
   const reviewTimeout = 15 * 60 * 1000;
   const siteSearch = /^\/(?:search(?:\/|$)|torrents\.php$)/i;
@@ -67,6 +68,7 @@
         }, review ? reviewTimeout + 65000 : 65000, signal);
         if (!receipt) throw new Error('未收到 PikPak 批次回执，请先检查云下载任务。');
         if (receipt.error) throw new Error(receipt.error);
+        return receipt.recordable !== false;
       });
     } finally {
       GM_deleteValue(jobKey);
@@ -88,12 +90,14 @@
     const queueId = current.searchParams.get(queueParam);
     if (queueId && /^[\da-f-]{36}$/i.test(queueId)) {
       const [jobKey, receiptKey] = queueKeys(queueId);
-      const ack = (sequence, error) => {
-        if (GM_getValue(jobKey)) GM_setValue(receiptKey, { sequence, error });
+      const ack = (sequence, error, recordable) => {
+        if (GM_getValue(jobKey)) GM_setValue(receiptKey, { sequence, error, recordable });
       };
       if (!GM_getValue(jobKey) || !await waitFor(() => openDialog(), 45000)) return;
-      let received = GM_getValue(receiptKey)?.sequence || 0;
-      ack(received);
+      const previousReceipt = GM_getValue(receiptKey);
+      if (previousReceipt?.error) return;
+      let received = previousReceipt?.sequence || 0;
+      if (!previousReceipt) ack(0);
       for (;;) {
         const job = GM_getValue(jobKey);
         if (!job || job.expires < Date.now()) return;
@@ -121,6 +125,7 @@
           fillLinks(input, job.links);
           await sleep(0);
           if (input.value.length !== job.links.length) throw new Error('PikPak 输入框未完整接收本批链接。');
+          let recordable = true;
           if (job.review) {
             GM_setClipboard(job.links, 'text');
             const feedback = document.createElement('p');
@@ -128,6 +133,7 @@
             feedback.textContent = `RARGB 第 ${received} / ${job.review.total} 批。核对保存位置后点击「立即创建」。`;
             input.before(feedback);
             let decision;
+            const onEdit = () => { recordable = false; };
             const onClick = event => {
               const control = event.target.closest?.('button');
               if (!control || !dialog.contains(control)) return;
@@ -137,6 +143,7 @@
               }
             };
             dialog.addEventListener('click', onClick, true);
+            input.addEventListener('input', onEdit);
             try {
               const action = await waitFor(() => decision || (!GM_getValue(jobKey) && 'stop')
                 || (!input.isConnected && 'cancel'), reviewTimeout);
@@ -144,6 +151,7 @@
               if (action !== 'submit') throw new Error(action === 'cancel' ? 'PikPak 批次已取消。' : '等待确认本批次超时。');
             } finally {
               dialog.removeEventListener('click', onClick, true);
+              input.removeEventListener('input', onEdit);
               feedback.remove();
             }
           } else {
@@ -161,7 +169,7 @@
             throw new Error('PikPak 未确认本批次，请检查任务状态。');
           }
           if (settled.failure) throw new Error(settled.failure);
-          ack(received);
+          ack(received, undefined, recordable);
         } catch (error) {
           ack(received, error.message);
           return;
@@ -277,6 +285,7 @@
       </form>
       <div id="status" role="status" aria-live="polite"></div>
       <div id="list"></div>
+      <label><input id="retry-history" type="checkbox"> 重新提交本机已记录的条目</label>
       <div class="actions">
         <button id="all" type="button">从当前页转存到最后一页</button>
         <button id="send" type="button" disabled>打开 PikPak 云下载</button>
@@ -301,7 +310,7 @@
 
   function updateControls() {
     const busy = Boolean(active);
-    for (const id of ['keyword', 'pages', 'scan', 'close']) get(id).disabled = busy;
+    for (const id of ['keyword', 'pages', 'scan', 'close', 'retry-history']) get(id).disabled = busy;
     get('all').disabled = busy || !firstRows.length;
     for (const id of ['select', 'clear']) get(id).disabled = busy || !entries.length;
     get('send').disabled = busy || !entries.some(entry => entry.checkbox.checked);
@@ -335,6 +344,27 @@
       active = undefined;
       updateControls();
     }
+  }
+
+  function runTransfer(task) {
+    return run(signal => navigator.locks.request('rargb-pikpak-transfer', { ifAvailable: true }, async lock => {
+      if (!lock) throw new Error('另一个 RARGB 标签页正在转存，请先结束那次操作。');
+      const history = new Set(GM_getValue(historyKey, []));
+      const seen = new Set();
+      const retry = get('retry-history').checked;
+      const keysFor = item => {
+        const title = item.title.normalize('NFKC').trim().replace(/\s+/gu, ' ').toLowerCase();
+        return [`id:${item.id}`, `title:${title}`];
+      };
+      await task(signal, {
+        isDuplicate: item => keysFor(item).some(key => seen.has(key) || (!retry && history.has(key))),
+        reserve: item => keysFor(item).forEach(key => seen.add(key)),
+        remember: batch => {
+          for (const { item } of batch) keysFor(item).forEach(key => history.add(key));
+          GM_setValue(historyKey, [...history]);
+        },
+      });
+    }));
   }
 
   get('open').onclick = () => { if (!dialog.open) dialog.showModal(); };
@@ -382,14 +412,14 @@
     });
   };
 
-  get('all').onclick = () => run(async signal => {
+  get('all').onclick = () => runTransfer(async (signal, dedup) => {
     let pages = 0;
     let submitted = 0;
     let skipped = 0;
+    let duplicates = 0;
     try {
       report('正在连接 PikPak。请保持两个标签页打开。');
       await withQueue(signal, async submit => {
-        const seen = new Set();
         const visited = new Set();
         let url = current;
         let page = document;
@@ -401,11 +431,14 @@
           if (!rows.length) throw new Error(`第 ${pages} 个扫描页面没有可读取的列表。`);
           const links = [];
           for (const item of rows) {
-            if (seen.has(item.id)) continue;
-            seen.add(item.id);
+            if (dedup.isDuplicate(item)) {
+              duplicates++;
+              continue;
+            }
             report(`正在读取第 ${pages} 个页面，已提交 ${submitted} 条。`);
             try {
-              links.push(await magnetFor(item, signal));
+              links.push({ item, magnet: await magnetFor(item, signal) });
+              dedup.reserve(item);
             } catch (error) {
               if (signal.aborted || error.stopBatch) throw error;
               skipped++;
@@ -414,36 +447,48 @@
           for (let offset = 0; offset < links.length; offset += batchSize) {
             const batch = links.slice(offset, offset + batchSize);
             report(`正在提交第 ${pages} 个页面的磁力链接，已提交 ${submitted} 条。`);
-            await submit(batch);
+            if (await submit(batch.map(entry => entry.magnet))) dedup.remember(batch);
             submitted += batch.length;
           }
           url = nextPage(page, url);
           if (url && !visited.has(url.href)) page = await readPage(url, signal);
         }
       });
-      report(`已处理到最后一页。扫描 ${pages} 页，提交 ${submitted} 条，${skipped} 条未取得磁力链接。`);
+      report(`已处理到最后一页。扫描 ${pages} 页，提交 ${submitted} 条，跳过 ${duplicates} 条重复记录，${skipped} 条未取得磁力链接。`);
     } catch (error) {
-      const progress = `已扫描 ${pages} 页，已确认提交 ${submitted} 条，${skipped} 条未取得磁力链接。`;
+      const progress = `已扫描 ${pages} 页，已确认提交 ${submitted} 条，跳过 ${duplicates} 条重复记录，${skipped} 条未取得磁力链接。`;
       report(signal.aborted ? `操作已停止。${progress}` : `${error.message} ${progress}`);
     }
   });
 
-  get('send').onclick = () => run(async signal => {
+  get('send').onclick = () => runTransfer(async (signal, dedup) => {
     const selected = entries.filter(entry => entry.checkbox.checked);
     const links = [];
+    let duplicates = 0;
     for (const [index, { item, note }] of selected.entries()) {
+      signal.throwIfAborted();
+      if (dedup.isDuplicate(item)) {
+        duplicates++;
+        note.textContent = '已跳过重复记录。';
+        continue;
+      }
       report(`正在读取第 ${index + 1} / ${selected.length} 条磁力链接。`);
       try {
-        links.push(await magnetFor(item, signal));
+        links.push({ item, magnet: await magnetFor(item, signal) });
+        dedup.reserve(item);
         note.textContent = '已取得磁力链接。';
       } catch (error) {
         if (signal.aborted || error.stopBatch) throw error;
         note.textContent = error.message;
       }
     }
-    if (!links.length) throw new Error('所选结果中未取得磁力链接。');
+    const skipped = selected.length - links.length - duplicates;
+    const summary = `跳过 ${duplicates} 条重复记录，${skipped} 条未取得磁力链接。`;
+    if (!links.length) {
+      report(`没有待提交的条目。${summary}`);
+      return;
+    }
     const total = Math.ceil(links.length / batchSize);
-    const skipped = selected.length - links.length;
     let submitted = 0;
     try {
       report('正在连接 PikPak。请保持两个标签页打开。');
@@ -451,13 +496,13 @@
         for (let offset = 0; offset < links.length; offset += batchSize) {
           const batch = links.slice(offset, offset + batchSize);
           report(`请在 PikPak 确认第 ${1 + offset / batchSize} / ${total} 批，已提交 ${submitted} 条。`);
-          await submit(batch, { total });
+          if (await submit(batch.map(entry => entry.magnet), { total })) dedup.remember(batch);
           submitted += batch.length;
         }
       });
-      report(`已提交 ${submitted} 条，共 ${total} 批。${skipped} 条未取得磁力链接。`);
+      report(`已提交 ${submitted} 条，共 ${total} 批。${summary}`);
     } catch (error) {
-      const progress = `已确认提交 ${submitted} 条，${skipped} 条未取得磁力链接。`;
+      const progress = `已确认提交 ${submitted} 条。${summary}`;
       report(signal.aborted ? `操作已停止。${progress}` : `${error.message} ${progress}`);
     }
   });
