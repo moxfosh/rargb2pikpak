@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RARGB 批量云下载到 PikPak
 // @namespace    rargb-pikpak
-// @version      3.2.0
+// @version      3.3.0
 // @description  将 RARGB 当前列表逐页转存到 PikPak，也可搜索并选择单独条目。
 // @match        https://rargb.to/*
 // @match        https://www.rargb.to/*
@@ -25,6 +25,7 @@
   const historyKey = 'rargb-pikpak-submission-history';
   const batchSize = 10;
   const reviewTimeout = 15 * 60 * 1000;
+  const requestInterval = 1200;
   const siteSearch = /^\/(?:search(?:\/|$)|torrents\.php$)/i;
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -127,10 +128,14 @@
           if (input.value.length !== job.links.length) throw new Error('PikPak 输入框未完整接收本批链接。');
           let recordable = true;
           if (job.review) {
-            GM_setClipboard(job.links, 'text');
             const feedback = document.createElement('p');
             feedback.setAttribute('role', 'status');
-            feedback.textContent = `RARGB 第 ${received} / ${job.review.total} 批。核对保存位置后点击「立即创建」。`;
+            if (job.review.page) {
+              feedback.textContent = `RARGB 第 ${job.review.page} 页，第 ${received} 批。点击「修改」选择保存文件夹，再点击「立即创建」。`;
+            } else {
+              GM_setClipboard(job.links, 'text');
+              feedback.textContent = `RARGB 第 ${received} / ${job.review.total} 批。核对保存位置后点击「立即创建」。`;
+            }
             input.before(feedback);
             let decision;
             const onEdit = () => { recordable = false; };
@@ -147,7 +152,10 @@
             try {
               const action = await waitFor(() => decision || (!GM_getValue(jobKey) && 'stop')
                 || (!input.isConnected && 'cancel'), reviewTimeout);
-              if (action === 'stop') return;
+              if (action === 'stop') {
+                if (input.isConnected && input.value === job.links) fillLinks(input, '');
+                return;
+              }
               if (action !== 'submit') throw new Error(action === 'cancel' ? 'PikPak 批次已取消。' : '等待确认本批次超时。');
             } finally {
               dialog.removeEventListener('click', onClick, true);
@@ -228,18 +236,56 @@
     return candidates[0];
   }
 
+  let nextRequestAt = 0;
+  let rateLimitedUntil = 0;
+
+  function siteRestriction(message, verificationUrl) {
+    return Object.assign(new Error(message), { stopBatch: true, verificationUrl });
+  }
+
+  function rateLimitError() {
+    const retryTime = new Date(rateLimitedUntil).toLocaleString();
+    return siteRestriction(`RARGB 限制了请求频率（HTTP 429）。请在 ${retryTime} 后重试。`);
+  }
+
   async function readPage(url, signal) {
-    const response = await fetch(url, {
-      mode: 'same-origin', credentials: 'same-origin', cache: 'no-store',
-      signal: AbortSignal.any([signal, AbortSignal.timeout(25000)]),
-    });
-    if (response.headers.get('cf-mitigated') === 'challenge' || response.status === 429) {
-      const error = new Error('站点要求验证或限制了请求频率，请处理后再试。');
-      error.stopBatch = true;
+    if (Date.now() < rateLimitedUntil) throw rateLimitError();
+    const delay = nextRequestAt - Date.now();
+    if (delay > 0) await sleep(delay);
+    signal.throwIfAborted();
+    const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(25000)]);
+    let response;
+    let page;
+    try {
+      response = await fetch(url, { mode: 'same-origin', credentials: 'same-origin', signal: requestSignal });
+      if (response.headers.get('cf-mitigated') === 'challenge') {
+        throw siteRestriction('RARGB 要求浏览器验证。请打开该页面完成验证后重试。', url);
+      }
+      if (response.status === 429) {
+        const now = Date.now();
+        const header = response.headers.get('Retry-After')?.trim();
+        const retryAt = /^\d+$/.test(header) ? now + Number(header) * 1000 : Date.parse(header);
+        rateLimitedUntil = Number.isFinite(new Date(retryAt).getTime())
+          ? Math.max(now + requestInterval, retryAt)
+          : now + 60000;
+        throw rateLimitError();
+      }
+      if (response.status === 403) {
+        throw siteRestriction('RARGB 拒绝了该请求（HTTP 403）。请打开该页面查看站点提示后重试。', url);
+      }
+      if (!response.ok) throw new Error(`RARGB 返回 HTTP ${response.status}。`);
+      page = new DOMParser().parseFromString(await response.text(), 'text/html');
+    } catch (error) {
+      if (requestSignal.reason?.name === 'TimeoutError') throw new Error('读取 RARGB 页面超时，请重试。');
       throw error;
+    } finally {
+      nextRequestAt = Date.now() + requestInterval;
     }
-    if (!response.ok) throw new Error(`站点返回 HTTP ${response.status}。`);
-    return new DOMParser().parseFromString(await response.text(), 'text/html');
+    if (page.querySelector('form#challenge-form[action*="__cf_chl"]')
+        || (/^just a moment/i.test(page.title) && page.querySelector('#challenge-stage, #cf-challenge-running'))) {
+      throw siteRestriction('RARGB 要求浏览器验证。请打开该页面完成验证后重试。', url);
+    }
+    return page;
   }
 
   async function magnetFor(item, signal) {
@@ -268,7 +314,7 @@
       button { font: inherit; border: 1px solid #cbd5e1; background: #fff; color: inherit; border-radius: 7px; padding: 5px 10px; cursor: pointer; }
       button:disabled { opacity: .55; cursor: default; }
       form, .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-      input { font: inherit; }
+      input, select { font: inherit; }
       input[type=number] { width: 4em; }
       #status { min-height: 1.5em; margin: 10px 0; }
       #list { margin: 10px 0; max-height: min(42vh, 310px); overflow: auto; }
@@ -284,9 +330,19 @@
         <button id="scan" type="submit">搜索</button>
       </form>
       <div id="status" role="status" aria-live="polite"></div>
+      <div id="scan-recovery" hidden>
+        <a id="verify-page" target="_blank" rel="noopener noreferrer" hidden>在新标签页打开该页</a>
+        <button id="resume-scan" type="button">继续扫描</button>
+      </div>
       <div id="list"></div>
       <label><input id="retry-history" type="checkbox"> 重新提交本机已记录的条目</label>
       <div class="actions">
+        <label>批量转存保存位置
+          <select id="transfer-folder">
+            <option value="choose">在 PikPak 选择（每批确认）</option>
+            <option value="default">PikPak 默认位置（自动提交）</option>
+          </select>
+        </label>
         <button id="all" type="button">从当前页转存到最后一页</button>
         <button id="send" type="button" disabled>打开 PikPak 云下载</button>
         <button id="select" type="button" disabled>全选</button>
@@ -305,13 +361,15 @@
   const currentKeyword = current.searchParams.get('search')?.trim();
   get('keyword').value = currentKeyword || '';
   const entries = [];
+  let searchScan;
   let active;
   const report = message => { get('status').textContent = message; };
 
   function updateControls() {
     const busy = Boolean(active);
-    for (const id of ['keyword', 'pages', 'scan', 'close', 'retry-history']) get(id).disabled = busy;
+    for (const id of ['keyword', 'pages', 'scan', 'close', 'retry-history', 'resume-scan']) get(id).disabled = busy;
     get('all').disabled = busy || !firstRows.length;
+    get('transfer-folder').disabled = get('all').disabled;
     for (const id of ['select', 'clear']) get(id).disabled = busy || !entries.length;
     get('send').disabled = busy || !entries.some(entry => entry.checkbox.checked);
     get('stop').disabled = !busy;
@@ -380,39 +438,62 @@
     };
   }
 
-  ui.querySelector('form').onsubmit = event => {
-    event.preventDefault();
-    return run(async signal => {
-      const keyword = get('keyword').value.trim();
-      if (!keyword) throw new Error('请输入关键词。');
-      const limit = get('pages').valueAsNumber;
-      if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('扫描页数须为正整数。');
-      entries.length = 0;
-      get('list').replaceChildren();
-      const found = new Set();
-      const visited = new Set();
-      const onSearch = siteSearch.test(current.pathname) && currentKeyword === keyword;
-      let url = onSearch ? current : new URL('/search/', current);
-      if (!onSearch) url.searchParams.set('search', keyword);
-      let page = onSearch ? document : await readPage(url, signal);
-      for (let number = 1; number <= limit && url && !visited.has(url.href); number++) {
+  async function scanSearch(signal) {
+    const { found, visited, limit } = searchScan;
+    const summary = () => `已扫描 ${visited.size} 页，找到 ${entries.length} 条结果。`;
+    get('scan-recovery').hidden = true;
+    try {
+      while (searchScan.url && !visited.has(searchScan.url.href)) {
         signal.throwIfAborted();
-        visited.add(url.href);
-        report(`正在扫描第 ${number} 页。`);
+        const url = searchScan.url;
+        report(`正在扫描第 ${visited.size + 1} 页。`);
+        const page = url.href === current.href ? document : await readPage(url, signal);
         for (const item of readResults(page, url)) {
           if (found.has(item.id)) continue;
           found.add(item.id);
           addEntry(item);
         }
-        if (number === limit) break;
-        url = nextPage(page, url);
-        if (url) page = await readPage(url, signal);
+        visited.add(url.href);
+        searchScan.url = visited.size < limit ? nextPage(page, url) : null;
       }
-      report(`扫描 ${visited.size} 页，找到 ${entries.length} 条结果。`);
+      searchScan = undefined;
+      report(summary());
+    } catch (error) {
+      if (signal.aborted) {
+        searchScan = undefined;
+        report(`扫描已停止。${summary()}`);
+        return;
+      }
+      const verify = get('verify-page');
+      verify.hidden = !error.verificationUrl;
+      if (error.verificationUrl) verify.href = error.verificationUrl.href;
+      else verify.removeAttribute('href');
+      get('scan-recovery').hidden = false;
+      report(`${error.message} ${summary()}`);
+    }
+  }
+
+  ui.querySelector('form').onsubmit = event => {
+    event.preventDefault();
+    return run(signal => {
+      const keyword = get('keyword').value.trim();
+      if (!keyword) throw new Error('请输入关键词。');
+      const limit = get('pages').valueAsNumber;
+      if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('扫描页数须为正整数。');
+      if (searchScan?.keyword === keyword && searchScan.limit === limit) return scanSearch(signal);
+      entries.length = 0;
+      get('list').replaceChildren();
+      const onSearch = siteSearch.test(current.pathname) && currentKeyword === keyword;
+      const url = onSearch ? current : new URL('/search/', current);
+      if (!onSearch) url.searchParams.set('search', keyword);
+      searchScan = { keyword, limit, url, found: new Set(), visited: new Set() };
+      return scanSearch(signal);
     });
   };
+  get('resume-scan').onclick = () => run(scanSearch);
 
   get('all').onclick = () => runTransfer(async (signal, dedup) => {
+    const chooseFolder = get('transfer-folder').value !== 'default';
     let pages = 0;
     let submitted = 0;
     let skipped = 0;
@@ -446,8 +527,11 @@
           }
           for (let offset = 0; offset < links.length; offset += batchSize) {
             const batch = links.slice(offset, offset + batchSize);
-            report(`正在提交第 ${pages} 个页面的磁力链接，已提交 ${submitted} 条。`);
-            if (await submit(batch.map(entry => entry.magnet))) dedup.remember(batch);
+            const review = chooseFolder ? { page: pages } : null;
+            report(chooseFolder
+              ? `请在 PikPak 选择第 ${pages} 页当前批次的保存文件夹，已提交 ${submitted} 条。`
+              : `正在提交第 ${pages} 页的磁力链接，已提交 ${submitted} 条。`);
+            if (await submit(batch.map(entry => entry.magnet), review)) dedup.remember(batch);
             submitted += batch.length;
           }
           url = nextPage(page, url);
